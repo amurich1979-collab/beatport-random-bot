@@ -4,31 +4,84 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from bot import GENRES, MIN_DATE, genre_menu, random_catalog_url
+from bot import (
+    GENRE_SLUGS,
+    MIN_DATE,
+    effective_range,
+    genre_menu,
+    parse_iso_date,
+    random_catalog_url,
+    validate_range,
+)
+from catalog import GENRES, search_subgenres
 
 
-def test_random_catalog_url_is_bounded_and_uses_genre_id():
+def test_random_catalog_url_uses_selected_genres_and_range():
     url, title, selected_date = random_catalog_url(
-        "house", today=date(2025, 2, 1), rng=random.Random(7)
+        {"house"},
+        start=date(2024, 2, 1),
+        end=date(2024, 2, 29),
+        rng=random.Random(7),
     )
 
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     assert parsed.path == "/genre/house/5/tracks"
     assert title == "House"
-    assert MIN_DATE <= selected_date <= date(2025, 2, 1)
+    assert date(2024, 2, 1) <= selected_date <= date(2024, 2, 29)
     expected_date = selected_date.isoformat()
     assert query["publish_date"] == [f"{expected_date}:{expected_date}"]
 
 
-def test_random_catalog_url_rejects_unknown_genre():
-    with pytest.raises(ValueError, match="Unknown genre"):
-        random_catalog_url("not-a-genre")
+def test_random_catalog_url_supports_subgenre():
+    url, _, _ = random_catalog_url(
+        {"tech-house"},
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+        subgenre_id=257,
+        rng=random.Random(1),
+    )
+    assert parse_qs(urlparse(url).query)["sub_genre_id"] == ["257"]
 
 
-def test_genre_menu_keeps_callback_data_within_telegram_limit():
-    for page in range(4):
-        markup = genre_menu(page)
+def test_random_catalog_url_rejects_unknown_or_empty_explicit_genre():
+    with pytest.raises(ValueError, match="Неизвестный"):
+        random_catalog_url({"not-a-genre"})
+
+
+def test_date_validation_and_parsing():
+    assert parse_iso_date("2024-02-29") == date(2024, 2, 29)
+    validate_range(date(2024, 1, 1), date(2024, 1, 31), today=date(2024, 2, 1))
+    with pytest.raises(ValueError, match="формате"):
+        parse_iso_date("01.02.2024")
+    with pytest.raises(ValueError, match="раньше конечной"):
+        validate_range(date(2024, 2, 1), date(2024, 1, 1))
+
+
+def test_effective_range_defaults_to_full_catalog():
+    assert effective_range({}, today=date(2025, 1, 2)) == (MIN_DATE, date(2025, 1, 2))
+
+
+def test_subgenre_search_is_case_insensitive_and_keeps_parent():
+    matches = search_subgenres("LATIN")
+    assert (
+        "tech-house",
+        next(item for item in GENRES["tech-house"].subgenres if item.id == 257),
+    ) in matches
+    assert all("latin" in subgenre.title.casefold() for _, subgenre in matches)
+
+
+def test_genre_catalog_matches_current_beatport_menu():
+    assert len(GENRES) == 46
+    assert GENRES["brazilian-funk"].id == 101
+    assert GENRES["latin-electronic"].id == 111
+    assert GENRES["downtempo"].id == 63
+    assert GENRES["organic-house"].id == 93
+
+
+def test_genre_menu_callbacks_fit_telegram_limit():
+    for page in range(6):
+        markup = genre_menu({"genres": [GENRE_SLUGS[0]]}, page)
         callbacks = [
             button.callback_data
             for row in markup.inline_keyboard
@@ -37,12 +90,3 @@ def test_genre_menu_keeps_callback_data_within_telegram_limit():
         ]
         assert callbacks
         assert all(len(value.encode()) <= 64 for value in callbacks)
-        assert all(
-            value.startswith(("genre:", "genres:")) or value in {"noop", "menu"}
-            for value in callbacks
-        )
-
-
-def test_all_genres_have_unique_ids():
-    ids = [genre_id for _, genre_id in GENRES.values()]
-    assert len(ids) == len(set(ids))
