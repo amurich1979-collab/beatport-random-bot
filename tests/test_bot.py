@@ -7,10 +7,14 @@ import pytest
 from bot import (
     GENRE_SLUGS,
     MIN_DATE,
+    date_menu,
     effective_range,
     genre_menu,
     parse_iso_date,
     random_catalog_url,
+    subgenre_genre_menu,
+    subgenre_menu,
+    subgenre_results_menu,
     validate_range,
 )
 from catalog import GENRES, search_subgenres
@@ -90,3 +94,48 @@ def test_genre_menu_callbacks_fit_telegram_limit():
         ]
         assert callbacks
         assert all(len(value.encode()) <= 64 for value in callbacks)
+
+
+def test_button_menus_expose_dates_and_subgenres_without_commands():
+    date_callbacks = {
+        button.callback_data
+        for row in date_menu().inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert {
+        "period:30",
+        "period:90",
+        "period:365",
+        "dates-custom",
+        "years",
+    } <= date_callbacks
+
+    tech_house_callbacks = {
+        button.callback_data
+        for row in subgenre_menu("tech-house").inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert any(value.endswith(":257") for value in tech_house_callbacks)
+    assert "subgenre-search" in tech_house_callbacks
+
+    browse_callbacks = {
+        button.callback_data
+        for row in subgenre_genre_menu(0).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert any(value.startswith("sg:") for value in browse_callbacks)
+
+
+def test_subgenre_results_menu_builds_selectable_buttons():
+    result = subgenre_results_menu("latin")
+    assert result is not None
+    text, markup = result
+    assert "Найдено" in text
+    assert any(
+        button.callback_data and button.callback_data.startswith("s:")
+        for row in markup.inline_keyboard
+        for button in row
+    )

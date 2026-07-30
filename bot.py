@@ -9,7 +9,14 @@ from datetime import date, timedelta
 from urllib.parse import urlencode
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from catalog import GENRES, search_subgenres
 
@@ -98,7 +105,8 @@ def main_menu(user_data: dict) -> InlineKeyboardMarkup:
                     "🎛 Жанры (можно несколько)", callback_data="genres:0"
                 )
             ],
-            [InlineKeyboardButton("📅 Год", callback_data="years")],
+            [InlineKeyboardButton("🔎 Поджанр", callback_data="subgenres")],
+            [InlineKeyboardButton("📅 Даты и год", callback_data="dates-menu")],
             [InlineKeyboardButton("♻️ Сбросить фильтры", callback_data="reset")],
         ]
     )
@@ -158,6 +166,110 @@ def year_menu() -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def date_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("30 дней", callback_data="period:30"),
+                InlineKeyboardButton("90 дней", callback_data="period:90"),
+            ],
+            [
+                InlineKeyboardButton("365 дней", callback_data="period:365"),
+                InlineKeyboardButton("Выбрать год", callback_data="years"),
+            ],
+            [InlineKeyboardButton("Свой диапазон", callback_data="dates-custom")],
+            [InlineKeyboardButton("Весь каталог", callback_data="period:all")],
+            [InlineKeyboardButton("В меню", callback_data="menu")],
+        ]
+    )
+
+
+def subgenre_menu(slug: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                item.title,
+                callback_data=f"s:{GENRE_SLUGS.index(slug)}:{item.id}",
+            )
+        ]
+        for item in GENRES[slug].subgenres
+    ]
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔎 Поиск по названию", callback_data="subgenre-search"
+                )
+            ],
+            [InlineKeyboardButton("Убрать поджанр", callback_data="subgenre-clear")],
+            [InlineKeyboardButton("В меню", callback_data="menu")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def subgenre_genre_menu(page: int) -> InlineKeyboardMarkup:
+    available = [slug for slug in GENRE_SLUGS if GENRES[slug].subgenres]
+    page_count = (len(available) + PAGE_SIZE - 1) // PAGE_SIZE
+    page = max(0, min(page, page_count - 1))
+    rows = [
+        [
+            InlineKeyboardButton(
+                GENRES[slug].title,
+                callback_data=f"sg:{GENRE_SLUGS.index(slug)}",
+            )
+        ]
+        for slug in available[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    ]
+    navigation = []
+    if page:
+        navigation.append(
+            InlineKeyboardButton("←", callback_data=f"sg-genres:{page - 1}")
+        )
+    navigation.append(
+        InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="noop")
+    )
+    if page + 1 < page_count:
+        navigation.append(
+            InlineKeyboardButton("→", callback_data=f"sg-genres:{page + 1}")
+        )
+    rows.extend(
+        [
+            navigation,
+            [
+                InlineKeyboardButton(
+                    "🔎 Поиск по названию", callback_data="subgenre-search"
+                )
+            ],
+            [InlineKeyboardButton("В меню", callback_data="menu")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def subgenre_results_menu(query: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    matches = search_subgenres(query)
+    if not matches:
+        return None
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{subgenre.title} — {GENRES[slug].title}",
+                callback_data=f"s:{GENRE_SLUGS.index(slug)}:{subgenre.id}",
+            )
+        ]
+        for slug, subgenre in matches[:20]
+    ]
+    rows.extend(
+        [
+            [InlineKeyboardButton("Искать ещё", callback_data="subgenre-search")],
+            [InlineKeyboardButton("В меню", callback_data="menu")],
+        ]
+    )
+    suffix = "\nПоказаны первые 20." if len(matches) > 20 else ""
+    return f"Найдено: {len(matches)}{suffix}", InlineKeyboardMarkup(rows)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -230,27 +342,59 @@ async def subgenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not query:
         await update.message.reply_text("Пример: /subgenre latin")
         return
-    matches = search_subgenres(query)
-    if not matches:
+    result = subgenre_results_menu(query)
+    if not result:
         await update.message.reply_text("Поджанры не найдены.")
         return
-    rows = []
-    for slug, subgenre in matches[:20]:
-        genre_index = GENRE_SLUGS.index(slug)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{subgenre.title} — {GENRES[slug].title}",
-                    callback_data=f"s:{genre_index}:{subgenre.id}",
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton("Отменить", callback_data="menu")])
-    suffix = "\nПоказаны первые 20." if len(matches) > 20 else ""
-    await update.message.reply_text(
-        f"Результаты поиска: {len(matches)}{suffix}",
-        reply_markup=InlineKeyboardMarkup(rows),
+    text, markup = result
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    pending = context.user_data.pop("pending_input", None)
+    text = update.message.text.strip()
+    cancel_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Отмена", callback_data="cancel-input")]]
     )
+    if pending == "dates":
+        parts = text.split()
+        if len(parts) != 2:
+            context.user_data["pending_input"] = "dates"
+            await update.message.reply_text(
+                "Нужно две даты через пробел, например:\n2024-01-01 2024-03-31",
+                reply_markup=cancel_markup,
+            )
+            return
+        try:
+            start_date, end_date = map(parse_iso_date, parts)
+            validate_range(start_date, end_date)
+        except ValueError as error:
+            context.user_data["pending_input"] = "dates"
+            await update.message.reply_text(str(error), reply_markup=cancel_markup)
+            return
+        context.user_data.update(date_start=start_date, date_end=end_date)
+        await update.message.reply_text(
+            "Диапазон сохранён.\n\n" + filter_summary(context.user_data),
+            reply_markup=main_menu(context.user_data),
+        )
+    elif pending == "subgenre":
+        result = subgenre_results_menu(text)
+        if not result:
+            context.user_data["pending_input"] = "subgenre"
+            await update.message.reply_text(
+                "Ничего не найдено. Попробуйте другое название.",
+                reply_markup=cancel_markup,
+            )
+            return
+        result_text, markup = result
+        await update.message.reply_text(result_text, reply_markup=markup)
+    else:
+        await update.message.reply_text(
+            "Все основные действия доступны кнопками:",
+            reply_markup=main_menu(context.user_data),
+        )
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,8 +406,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "noop":
         return
     if data == "menu":
+        context.user_data.pop("pending_input", None)
         await query.edit_message_text(
             filter_summary(context.user_data), reply_markup=main_menu(context.user_data)
+        )
+    elif data == "cancel-input":
+        context.user_data.pop("pending_input", None)
+        await query.edit_message_text(
+            "Ввод отменён.\n\n" + filter_summary(context.user_data),
+            reply_markup=main_menu(context.user_data),
         )
     elif data == "reset":
         context.user_data.clear()
@@ -293,6 +444,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_reply_markup(
             reply_markup=genre_menu(context.user_data, int(page_text))
         )
+    elif data == "dates-menu":
+        await query.edit_message_text("Выберите период:", reply_markup=date_menu())
+    elif data == "dates-custom":
+        context.user_data["pending_input"] = "dates"
+        await query.edit_message_text(
+            "Отправьте две даты одним сообщением:\n2024-01-01 2024-03-31",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="cancel-input")]]
+            ),
+        )
+    elif data.startswith("period:"):
+        value = data.split(":")[1]
+        if value == "all":
+            context.user_data.pop("date_start", None)
+            context.user_data.pop("date_end", None)
+        else:
+            end_date = date.today()
+            context.user_data["date_end"] = end_date
+            context.user_data["date_start"] = max(
+                MIN_DATE, end_date - timedelta(days=int(value) - 1)
+            )
+        await query.edit_message_text(
+            filter_summary(context.user_data), reply_markup=main_menu(context.user_data)
+        )
     elif data == "years":
         await query.edit_message_text("Выберите год:", reply_markup=year_menu())
     elif data.startswith("year:"):
@@ -306,6 +481,44 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["date_end"] = min(date(year, 12, 31), date.today())
         await query.edit_message_text(
             filter_summary(context.user_data), reply_markup=main_menu(context.user_data)
+        )
+    elif data == "subgenres":
+        selected = selected_genres(context.user_data)
+        if len(selected) == 1 and GENRES[next(iter(selected))].subgenres:
+            slug = next(iter(selected))
+            await query.edit_message_text(
+                f"Поджанры: {GENRES[slug].title}",
+                reply_markup=subgenre_menu(slug),
+            )
+        else:
+            await query.edit_message_text(
+                "Выберите родительский жанр:",
+                reply_markup=subgenre_genre_menu(0),
+            )
+    elif data.startswith("sg-genres:"):
+        await query.edit_message_text(
+            "Выберите родительский жанр:",
+            reply_markup=subgenre_genre_menu(int(data.split(":")[1])),
+        )
+    elif data.startswith("sg:"):
+        slug = GENRE_SLUGS[int(data.split(":")[1])]
+        await query.edit_message_text(
+            f"Поджанры: {GENRES[slug].title}",
+            reply_markup=subgenre_menu(slug),
+        )
+    elif data == "subgenre-search":
+        context.user_data["pending_input"] = "subgenre"
+        await query.edit_message_text(
+            "Напишите часть названия поджанра, например: latin",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="cancel-input")]]
+            ),
+        )
+    elif data == "subgenre-clear":
+        context.user_data.pop("subgenre", None)
+        await query.edit_message_text(
+            "Поджанр убран.\n\n" + filter_summary(context.user_data),
+            reply_markup=main_menu(context.user_data),
         )
     elif data.startswith("s:"):
         _, genre_index, subgenre_id = data.split(":")
@@ -359,6 +572,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("dates", dates_command))
     application.add_handler(CommandHandler("subgenre", subgenre_command))
     application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_error_handler(error_handler)
     return application
 
