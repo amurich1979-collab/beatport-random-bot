@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import shutil
 from datetime import date, timedelta
 from pathlib import Path
 from typing import IO
@@ -14,6 +15,8 @@ from urllib.parse import urlencode, urljoin
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import async_playwright
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -31,6 +34,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 from catalog import GENRES, search_subgenres
+from history import HistoryStore
 
 LOGGER = logging.getLogger(__name__)
 MIN_DATE = date(2004, 1, 1)
@@ -42,6 +46,7 @@ LINK_PREVIEW = LinkPreviewOptions(
     prefer_large_media=True,
     show_above_text=False,
 )
+HISTORY = HistoryStore(os.getenv("HISTORY_DB", "history.sqlite3"))
 
 
 def acquire_instance_lock() -> None:
@@ -165,13 +170,113 @@ def extract_preview_tracks(html: str) -> list[tuple[str, str]]:
     return sorted(pairs)
 
 
+def chrome_executable() -> str | None:
+    configured = os.getenv("CHROME_PATH")
+    candidates = [
+        configured,
+        shutil.which("chrome"),
+        shutil.which("msedge"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    return next((path for path in candidates if path and Path(path).is_file()), None)
+
+
+async def browser_release_url(
+    genres: set[str] | None,
+    *,
+    start: date,
+    end: date | None,
+    subgenre_id: int | None,
+    attempts: int,
+    excluded_urls: set[str],
+) -> tuple[str | None, str | None, str, date, str]:
+    """Render Beatport in regular Chrome when direct HTTP is blocked."""
+    executable = chrome_executable()
+    if not executable:
+        return None, None, "", start, ""
+    last_catalog_url = ""
+    last_genre = ""
+    last_date = start
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=False,
+                executable_path=executable,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-position=-32000,-32000",
+                    "--window-size=1200,800",
+                ],
+            )
+            try:
+                page = await browser.new_page(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/138.0.0.0 Safari/537.36"
+                    )
+                )
+                for _ in range(attempts):
+                    last_catalog_url, last_genre, last_date = random_catalog_url(
+                        genres,
+                        start=start,
+                        end=end,
+                        subgenre_id=subgenre_id,
+                    )
+                    response = await page.goto(
+                        last_catalog_url,
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    if not response or not response.ok:
+                        continue
+                    await page.wait_for_timeout(500)
+                    html = await page.content()
+                    preview_tracks = [
+                        pair
+                        for pair in extract_preview_tracks(html)
+                        if pair[0] not in excluded_urls
+                    ]
+                    if preview_tracks:
+                        release_url, preview_url = random.choice(preview_tracks)
+                        return (
+                            release_url,
+                            preview_url,
+                            last_genre,
+                            last_date,
+                            last_catalog_url,
+                        )
+                    release_links = set(
+                        await page.locator('a[href*="/release/"]').evaluate_all(
+                            "(items) => items.map((item) => item.href)"
+                        )
+                    )
+                    available = release_links - excluded_urls
+                    if available:
+                        return (
+                            random.choice(tuple(available)),
+                            None,
+                            last_genre,
+                            last_date,
+                            last_catalog_url,
+                        )
+            finally:
+                await browser.close()
+    except PlaywrightError:
+        LOGGER.warning("Chrome fallback could not render Beatport", exc_info=True)
+    return None, None, last_genre, last_date, last_catalog_url
+
+
 async def random_release_url(
     genres: set[str] | None = None,
     *,
     start: date = MIN_DATE,
     end: date | None = None,
     subgenre_id: int | None = None,
-    attempts: int = 8,
+    attempts: int = 15,
+    excluded_urls: set[str] | None = None,
 ) -> tuple[str | None, str | None, str, date, str]:
     """Try the original HTML release lookup, retaining the catalog URL as fallback."""
     headers = {
@@ -198,8 +303,13 @@ async def random_release_url(
                 break
             if response.is_success:
                 preview_tracks = extract_preview_tracks(response.text)
-                if preview_tracks:
-                    release_url, preview_url = random.choice(preview_tracks)
+                available_previews = [
+                    pair
+                    for pair in preview_tracks
+                    if pair[0] not in (excluded_urls or set())
+                ]
+                if available_previews:
+                    release_url, preview_url = random.choice(available_previews)
                     return (
                         release_url,
                         preview_url,
@@ -213,15 +323,23 @@ async def random_release_url(
                     for anchor in soup.select('a[href*="/release/"]')
                     if anchor.get("href")
                 }
-                if release_links:
+                available_links = release_links - (excluded_urls or set())
+                if available_links:
                     return (
-                        random.choice(tuple(release_links)),
+                        random.choice(tuple(available_links)),
                         None,
                         last_genre,
                         last_date,
                         last_catalog_url,
                     )
-    return None, None, last_genre, last_date, last_catalog_url
+    return await browser_release_url(
+        genres,
+        start=start,
+        end=end,
+        subgenre_id=subgenre_id,
+        attempts=attempts,
+        excluded_urls=excluded_urls or set(),
+    )
 
 
 def filter_summary(user_data: dict) -> str:
@@ -553,7 +671,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data == "menu":
         context.user_data.pop("pending_input", None)
-        await query.edit_message_text(
+        await query.message.reply_text(
             filter_summary(context.user_data), reply_markup=main_menu(context.user_data)
         )
     elif data == "cancel-input":
@@ -687,33 +805,44 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "random-release":
         start_date, end_date = effective_range(context.user_data)
         subgenre = context.user_data.get("subgenre")
-        await query.edit_message_text("Ищу случайный релиз Beatport…")
+        user_id = query.from_user.id
         (
             release_url,
             preview_url,
             genre_title,
             selected_date,
-            catalog_url,
+            _catalog_url,
         ) = await random_release_url(
             selected_genres(context.user_data),
             start=start_date,
             end=end_date,
             subgenre_id=subgenre["id"] if subgenre else None,
+            excluded_urls=HISTORY.urls_for_user(user_id),
         )
         if release_url:
+            HISTORY.add(user_id, release_url)
             text = (
                 f"Случайный релиз\nЖанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
             )
             target_url = release_url
             open_label = "Открыть релиз"
         else:
-            text = (
-                "Beatport не отдал список релизов напрямую. "
-                "Откройте выбранный день в каталоге.\n\n"
-                f"Жанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
+            await query.message.reply_text(
+                "Не удалось получить конкретный релиз после 15 попыток. "
+                "Страница случайного дня здесь намеренно не подставляется. "
+                "Попробуйте ещё раз или измените диапазон дат.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🎲 Повторить", callback_data="random-release"
+                            )
+                        ],
+                        [InlineKeyboardButton("В меню", callback_data="menu")],
+                    ]
+                ),
             )
-            target_url = catalog_url
-            open_label = "Открыть каталог"
+            return
         buttons = [[InlineKeyboardButton(open_label, url=target_url)]]
         if preview_url:
             buttons.append(
@@ -725,7 +854,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 [InlineKeyboardButton("В меню", callback_data="menu")],
             ]
         )
-        await query.edit_message_text(
+        await query.message.reply_text(
             text
             + (f"\nПоджанр: {subgenre['title']}" if subgenre else "")
             + f"\n\n{target_url}",
@@ -743,13 +872,36 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "random-day":
         start_date, end_date = effective_range(context.user_data)
         subgenre = context.user_data.get("subgenre")
-        url, genre_title, selected_date = random_catalog_url(
+        (
+            verified_release,
+            _preview_url,
+            genre_title,
+            selected_date,
+            url,
+        ) = await random_release_url(
             selected_genres(context.user_data),
             start=start_date,
             end=end_date,
             subgenre_id=subgenre["id"] if subgenre else None,
+            excluded_urls=set(),
         )
-        await query.edit_message_text(
+        if not verified_release:
+            await query.message.reply_text(
+                "Не удалось найти непустой случайный день после 15 попыток. "
+                "Попробуйте ещё раз или измените диапазон.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "📀 Повторить", callback_data="random-day"
+                            )
+                        ],
+                        [InlineKeyboardButton("В меню", callback_data="menu")],
+                    ]
+                ),
+            )
+            return
+        await query.message.reply_text(
             f"Жанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
             + (f"\nПоджанр: {subgenre['title']}" if subgenre else "")
             + f"\n\n{url}",

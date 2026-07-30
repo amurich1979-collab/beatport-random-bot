@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 .bot.lock
+history.sqlite3*
 
 # Historical prototypes are kept locally for reference and are not shipped.
 beatport_random_bot.py

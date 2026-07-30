@@ -22,6 +22,7 @@ from bot import (
     validate_range,
 )
 from catalog import GENRES, search_subgenres
+from history import HistoryStore
 
 
 def test_random_catalog_url_uses_selected_genres_and_range():
@@ -206,3 +207,18 @@ def test_lock_file_is_ignored_by_git():
         Path(__file__).parents[1].joinpath(".gitignore").read_text(encoding="utf-8")
     )
     assert ".bot.lock" in gitignore
+
+
+def test_release_history_is_persistent_and_user_specific(tmp_path):
+    database = tmp_path / "history.sqlite3"
+    first_store = HistoryStore(database)
+    first_store.add(10, "https://www.beatport.com/release/one/1")
+    first_store.add(10, "https://www.beatport.com/release/one/1")
+    first_store.add(20, "https://www.beatport.com/release/two/2")
+
+    second_store = HistoryStore(database)
+    assert second_store.urls_for_user(10) == {"https://www.beatport.com/release/one/1"}
+    assert second_store.urls_for_user(20) == {"https://www.beatport.com/release/two/2"}
+
+    second_store.clear_user(10)
+    assert second_store.urls_for_user(10) == set()
