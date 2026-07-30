@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+
+# Historical prototypes are kept locally for reference and are not shipped.
+beatport_random_bot.py
+beatport_random_bot test.py
+beatport_random_bot subgenre select.py
+beatport_random_bot subgenre select2.py
