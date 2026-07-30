@@ -8,8 +8,10 @@ import random
 from datetime import date, timedelta
 from pathlib import Path
 from typing import IO
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
+import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -113,6 +115,54 @@ def random_catalog_url(
     )
 
 
+async def random_release_url(
+    genres: set[str] | None = None,
+    *,
+    start: date = MIN_DATE,
+    end: date | None = None,
+    subgenre_id: int | None = None,
+    attempts: int = 8,
+) -> tuple[str | None, str, date, str]:
+    """Try the original HTML release lookup, retaining the catalog URL as fallback."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+        )
+    }
+    last_catalog_url = ""
+    last_genre = ""
+    last_date = start
+    async with httpx.AsyncClient(
+        headers=headers, follow_redirects=True, timeout=12
+    ) as client:
+        for _ in range(attempts):
+            last_catalog_url, last_genre, last_date = random_catalog_url(
+                genres,
+                start=start,
+                end=end,
+                subgenre_id=subgenre_id,
+            )
+            response = await client.get(last_catalog_url)
+            if response.status_code in {401, 403, 429}:
+                break
+            if response.is_success:
+                soup = BeautifulSoup(response.text, "html.parser")
+                release_links = {
+                    urljoin("https://www.beatport.com", anchor["href"])
+                    for anchor in soup.select('a[href*="/release/"]')
+                    if anchor.get("href")
+                }
+                if release_links:
+                    return (
+                        random.choice(tuple(release_links)),
+                        last_genre,
+                        last_date,
+                        last_catalog_url,
+                    )
+    return None, last_genre, last_date, last_catalog_url
+
+
 def filter_summary(user_data: dict) -> str:
     genres = selected_genres(user_data)
     genre_text = (
@@ -129,14 +179,19 @@ def filter_summary(user_data: dict) -> str:
 def main_menu(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎲 Случайный день", callback_data="random")],
             [
                 InlineKeyboardButton(
-                    "🎛 Жанры (можно несколько)", callback_data="genres:0"
+                    "🎲 Случайный релиз", callback_data="random-release"
                 )
             ],
-            [InlineKeyboardButton("🔎 Поджанр", callback_data="subgenres")],
-            [InlineKeyboardButton("📅 Даты и год", callback_data="dates-menu")],
+            [
+                InlineKeyboardButton(
+                    "📀 Релизы за один случайный день", callback_data="random-day"
+                )
+            ],
+            [InlineKeyboardButton("🎛 Выбрать жанр", callback_data="genres:0")],
+            [InlineKeyboardButton("🔎 Выбрать поджанр", callback_data="subgenres")],
+            [InlineKeyboardButton("📅 Диапазон дат / год", callback_data="dates-menu")],
             [InlineKeyboardButton("♻️ Сбросить фильтры", callback_data="reset")],
         ]
     )
@@ -568,7 +623,45 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(
             filter_summary(context.user_data), reply_markup=main_menu(context.user_data)
         )
-    elif data == "random":
+    elif data == "random-release":
+        start_date, end_date = effective_range(context.user_data)
+        subgenre = context.user_data.get("subgenre")
+        await query.edit_message_text("Ищу случайный релиз Beatport…")
+        release_url, genre_title, selected_date, catalog_url = await random_release_url(
+            selected_genres(context.user_data),
+            start=start_date,
+            end=end_date,
+            subgenre_id=subgenre["id"] if subgenre else None,
+        )
+        if release_url:
+            text = (
+                f"Случайный релиз\nЖанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
+            )
+            target_url = release_url
+            open_label = "Открыть релиз"
+        else:
+            text = (
+                "Beatport не отдал список релизов напрямую. "
+                "Откройте выбранный день в каталоге.\n\n"
+                f"Жанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
+            )
+            target_url = catalog_url
+            open_label = "Открыть каталог"
+        await query.edit_message_text(
+            text + (f"\nПоджанр: {subgenre['title']}" if subgenre else ""),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(open_label, url=target_url)],
+                    [
+                        InlineKeyboardButton(
+                            "🎲 Ещё релиз", callback_data="random-release"
+                        )
+                    ],
+                    [InlineKeyboardButton("В меню", callback_data="menu")],
+                ]
+            ),
+        )
+    elif data == "random-day":
         start_date, end_date = effective_range(context.user_data)
         subgenre = context.user_data.get("subgenre")
         url, genre_title, selected_date = random_catalog_url(
@@ -583,7 +676,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("Открыть Beatport", url=url)],
-                    [InlineKeyboardButton("🎲 Ещё", callback_data="random")],
+                    [
+                        InlineKeyboardButton(
+                            "📀 Ещё случайный день", callback_data="random-day"
+                        )
+                    ],
                     [InlineKeyboardButton("В меню", callback_data="menu")],
                 ]
             ),

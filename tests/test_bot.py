@@ -11,6 +11,7 @@ from bot import (
     date_menu,
     effective_range,
     genre_menu,
+    main_menu,
     parse_iso_date,
     random_catalog_url,
     subgenre_genre_menu,
@@ -128,6 +129,21 @@ def test_button_menus_expose_dates_and_subgenres_without_commands():
         if button.callback_data
     }
     assert any(value.startswith("sg:") for value in browse_callbacks)
+
+
+def test_main_menu_preserves_original_actions_and_adds_filters():
+    buttons = [
+        (button.text, button.callback_data)
+        for row in main_menu({}).inline_keyboard
+        for button in row
+    ]
+    assert buttons[:3] == [
+        ("🎲 Случайный релиз", "random-release"),
+        ("📀 Релизы за один случайный день", "random-day"),
+        ("🎛 Выбрать жанр", "genres:0"),
+    ]
+    callbacks = {callback for _, callback in buttons}
+    assert {"subgenres", "dates-menu", "reset"} <= callbacks
 
 
 def test_subgenre_results_menu_builds_selectable_buttons():
