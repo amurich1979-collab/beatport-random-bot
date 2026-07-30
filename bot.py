@@ -6,7 +6,8 @@ import json
 import logging
 import os
 import random
-import shutil
+import asyncio
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import IO
@@ -15,8 +16,6 @@ from urllib.parse import urlencode, urljoin
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import async_playwright
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -47,6 +46,9 @@ LINK_PREVIEW = LinkPreviewOptions(
     show_above_text=False,
 )
 HISTORY = HistoryStore(os.getenv("HISTORY_DB", "history.sqlite3"))
+BEATPORT_REQUEST_LOCK = asyncio.Lock()
+BEATPORT_MIN_INTERVAL = 4.0
+_last_beatport_request = 0.0
 
 
 def acquire_instance_lock() -> None:
@@ -170,103 +172,16 @@ def extract_preview_tracks(html: str) -> list[tuple[str, str]]:
     return sorted(pairs)
 
 
-def chrome_executable() -> str | None:
-    configured = os.getenv("CHROME_PATH")
-    candidates = [
-        configured,
-        shutil.which("chrome"),
-        shutil.which("msedge"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    return next((path for path in candidates if path and Path(path).is_file()), None)
-
-
-async def browser_release_url(
-    genres: set[str] | None,
-    *,
-    start: date,
-    end: date | None,
-    subgenre_id: int | None,
-    attempts: int,
-    excluded_urls: set[str],
-) -> tuple[str | None, str | None, str, date, str]:
-    """Render Beatport in regular Chrome when direct HTTP is blocked."""
-    executable = chrome_executable()
-    if not executable:
-        return None, None, "", start, ""
-    last_catalog_url = ""
-    last_genre = ""
-    last_date = start
-    try:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=False,
-                executable_path=executable,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-position=-32000,-32000",
-                    "--window-size=1200,800",
-                ],
-            )
-            try:
-                page = await browser.new_page(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/138.0.0.0 Safari/537.36"
-                    )
-                )
-                for _ in range(attempts):
-                    last_catalog_url, last_genre, last_date = random_catalog_url(
-                        genres,
-                        start=start,
-                        end=end,
-                        subgenre_id=subgenre_id,
-                    )
-                    response = await page.goto(
-                        last_catalog_url,
-                        wait_until="domcontentloaded",
-                        timeout=30_000,
-                    )
-                    if not response or not response.ok:
-                        continue
-                    await page.wait_for_timeout(500)
-                    html = await page.content()
-                    preview_tracks = [
-                        pair
-                        for pair in extract_preview_tracks(html)
-                        if pair[0] not in excluded_urls
-                    ]
-                    if preview_tracks:
-                        release_url, preview_url = random.choice(preview_tracks)
-                        return (
-                            release_url,
-                            preview_url,
-                            last_genre,
-                            last_date,
-                            last_catalog_url,
-                        )
-                    release_links = set(
-                        await page.locator('a[href*="/release/"]').evaluate_all(
-                            "(items) => items.map((item) => item.href)"
-                        )
-                    )
-                    available = release_links - excluded_urls
-                    if available:
-                        return (
-                            random.choice(tuple(available)),
-                            None,
-                            last_genre,
-                            last_date,
-                            last_catalog_url,
-                        )
-            finally:
-                await browser.close()
-    except PlaywrightError:
-        LOGGER.warning("Chrome fallback could not render Beatport", exc_info=True)
-    return None, None, last_genre, last_date, last_catalog_url
+async def beatport_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Serialize and pace Beatport traffic to avoid request bursts."""
+    global _last_beatport_request
+    async with BEATPORT_REQUEST_LOCK:
+        remaining = BEATPORT_MIN_INTERVAL - (time.monotonic() - _last_beatport_request)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        response = await client.get(url)
+        _last_beatport_request = time.monotonic()
+        return response
 
 
 async def random_release_url(
@@ -275,7 +190,7 @@ async def random_release_url(
     start: date = MIN_DATE,
     end: date | None = None,
     subgenre_id: int | None = None,
-    attempts: int = 15,
+    attempts: int = 5,
     excluded_urls: set[str] | None = None,
 ) -> tuple[str | None, str | None, str, date, str]:
     """Try the original HTML release lookup, retaining the catalog URL as fallback."""
@@ -289,7 +204,10 @@ async def random_release_url(
     last_genre = ""
     last_date = start
     async with httpx.AsyncClient(
-        headers=headers, follow_redirects=True, timeout=12
+        headers=headers,
+        follow_redirects=True,
+        timeout=12,
+        proxy=os.getenv("BEATPORT_PROXY") or None,
     ) as client:
         for _ in range(attempts):
             last_catalog_url, last_genre, last_date = random_catalog_url(
@@ -298,7 +216,7 @@ async def random_release_url(
                 end=end,
                 subgenre_id=subgenre_id,
             )
-            response = await client.get(last_catalog_url)
+            response = await beatport_get(client, last_catalog_url)
             if response.status_code in {401, 403, 429}:
                 break
             if response.is_success:
@@ -332,14 +250,7 @@ async def random_release_url(
                         last_date,
                         last_catalog_url,
                     )
-    return await browser_release_url(
-        genres,
-        start=start,
-        end=end,
-        subgenre_id=subgenre_id,
-        attempts=attempts,
-        excluded_urls=excluded_urls or set(),
-    )
+    return None, None, last_genre, last_date, last_catalog_url
 
 
 def filter_summary(user_data: dict) -> str:
@@ -828,9 +739,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             open_label = "Открыть релиз"
         else:
             await query.message.reply_text(
-                "Не удалось получить конкретный релиз после 15 попыток. "
+                "Не удалось получить конкретный релиз после 5 аккуратных попыток. "
                 "Страница случайного дня здесь намеренно не подставляется. "
-                "Попробуйте ещё раз или измените диапазон дат.",
+                "Если Beatport включил защиту, бот не будет обходить её через ваш Chrome. "
+                "Попробуйте позже или измените диапазон дат.",
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
@@ -887,8 +799,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         if not verified_release:
             await query.message.reply_text(
-                "Не удалось найти непустой случайный день после 15 попыток. "
-                "Попробуйте ещё раз или измените диапазон.",
+                "Не удалось найти непустой случайный день после 5 аккуратных попыток. "
+                "Если Beatport включил защиту, попробуйте позже или измените диапазон.",
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
