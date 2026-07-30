@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -27,6 +28,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import TelegramError
 
 from catalog import GENRES, search_subgenres
 
@@ -125,6 +127,44 @@ def random_catalog_url(
     )
 
 
+def extract_preview_tracks(html: str) -> list[tuple[str, str]]:
+    """Extract verified release/preview pairs from Beatport page data."""
+    soup = BeautifulSoup(html, "html.parser")
+    pairs: set[tuple[str, str]] = set()
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            sample_url = value.get("sample_url")
+            release = value.get("release")
+            if (
+                isinstance(sample_url, str)
+                and sample_url.startswith("https://geo-samples.beatport.com/track/")
+                and sample_url.endswith(".mp3")
+                and isinstance(release, dict)
+                and isinstance(release.get("id"), int)
+                and isinstance(release.get("slug"), str)
+            ):
+                pairs.add(
+                    (
+                        "https://www.beatport.com/release/"
+                        f"{release['slug']}/{release['id']}",
+                        sample_url,
+                    )
+                )
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for script in soup.select('script[type="application/json"]'):
+        try:
+            walk(json.loads(script.get_text()))
+        except (json.JSONDecodeError, RecursionError):
+            continue
+    return sorted(pairs)
+
+
 async def random_release_url(
     genres: set[str] | None = None,
     *,
@@ -132,7 +172,7 @@ async def random_release_url(
     end: date | None = None,
     subgenre_id: int | None = None,
     attempts: int = 8,
-) -> tuple[str | None, str, date, str]:
+) -> tuple[str | None, str | None, str, date, str]:
     """Try the original HTML release lookup, retaining the catalog URL as fallback."""
     headers = {
         "User-Agent": (
@@ -157,6 +197,16 @@ async def random_release_url(
             if response.status_code in {401, 403, 429}:
                 break
             if response.is_success:
+                preview_tracks = extract_preview_tracks(response.text)
+                if preview_tracks:
+                    release_url, preview_url = random.choice(preview_tracks)
+                    return (
+                        release_url,
+                        preview_url,
+                        last_genre,
+                        last_date,
+                        last_catalog_url,
+                    )
                 soup = BeautifulSoup(response.text, "html.parser")
                 release_links = {
                     urljoin("https://www.beatport.com", anchor["href"])
@@ -166,11 +216,12 @@ async def random_release_url(
                 if release_links:
                     return (
                         random.choice(tuple(release_links)),
+                        None,
                         last_genre,
                         last_date,
                         last_catalog_url,
                     )
-    return None, last_genre, last_date, last_catalog_url
+    return None, None, last_genre, last_date, last_catalog_url
 
 
 def filter_summary(user_data: dict) -> str:
@@ -637,7 +688,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         start_date, end_date = effective_range(context.user_data)
         subgenre = context.user_data.get("subgenre")
         await query.edit_message_text("Ищу случайный релиз Beatport…")
-        release_url, genre_title, selected_date, catalog_url = await random_release_url(
+        (
+            release_url,
+            preview_url,
+            genre_title,
+            selected_date,
+            catalog_url,
+        ) = await random_release_url(
             selected_genres(context.user_data),
             start=start_date,
             end=end_date,
@@ -657,23 +714,32 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             target_url = catalog_url
             open_label = "Открыть каталог"
+        buttons = [[InlineKeyboardButton(open_label, url=target_url)]]
+        if preview_url:
+            buttons.append(
+                [InlineKeyboardButton("▶️ Открыть предпрослушку", url=preview_url)]
+            )
+        buttons.extend(
+            [
+                [InlineKeyboardButton("🎲 Ещё релиз", callback_data="random-release")],
+                [InlineKeyboardButton("В меню", callback_data="menu")],
+            ]
+        )
         await query.edit_message_text(
             text
             + (f"\nПоджанр: {subgenre['title']}" if subgenre else "")
             + f"\n\n{target_url}",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton(open_label, url=target_url)],
-                    [
-                        InlineKeyboardButton(
-                            "🎲 Ещё релиз", callback_data="random-release"
-                        )
-                    ],
-                    [InlineKeyboardButton("В меню", callback_data="menu")],
-                ]
-            ),
+            reply_markup=InlineKeyboardMarkup(buttons),
             link_preview_options=LINK_PREVIEW,
         )
+        if preview_url and query.message:
+            try:
+                await query.message.reply_audio(
+                    audio=preview_url,
+                    caption="Предпрослушка Beatport",
+                )
+            except TelegramError:
+                LOGGER.warning("Telegram could not fetch Beatport preview audio")
     elif data == "random-day":
         start_date, end_date = effective_range(context.user_data)
         subgenre = context.user_data.get("subgenre")

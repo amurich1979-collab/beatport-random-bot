@@ -11,6 +11,7 @@ from bot import (
     MIN_DATE,
     date_menu,
     effective_range,
+    extract_preview_tracks,
     genre_menu,
     main_menu,
     parse_iso_date,
@@ -150,6 +151,42 @@ def test_main_menu_preserves_original_actions_and_adds_filters():
 def test_telegram_link_preview_is_enabled_for_cover_cards():
     assert LINK_PREVIEW.is_disabled is False
     assert LINK_PREVIEW.prefer_large_media is True
+
+
+def test_preview_extraction_keeps_release_and_audio_together():
+    html = """
+    <script type="application/json">
+    {
+      "props": {
+        "track": {
+          "id": 29511152,
+          "sample_url":
+            "https://geo-samples.beatport.com/track/example.LOFI.mp3",
+          "release": {
+            "id": 7133629,
+            "slug": "especial-do-kamehameha"
+          }
+        }
+      }
+    }
+    </script>
+    """
+    assert extract_preview_tracks(html) == [
+        (
+            "https://www.beatport.com/release/especial-do-kamehameha/7133629",
+            "https://geo-samples.beatport.com/track/example.LOFI.mp3",
+        )
+    ]
+
+
+def test_preview_extraction_rejects_untrusted_audio_hosts():
+    html = """
+    <script type="application/json">
+    {"sample_url": "https://example.com/not-beatport.mp3",
+     "release": {"id": 1, "slug": "wrong"}}
+    </script>
+    """
+    assert extract_preview_tracks(html) == []
 
 
 def test_subgenre_results_menu_builds_selectable_buttons():
