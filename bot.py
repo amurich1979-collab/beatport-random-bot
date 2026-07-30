@@ -8,6 +8,7 @@ import random
 from datetime import date, timedelta
 from urllib.parse import urlencode
 
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -578,9 +579,13 @@ def build_application(token: str) -> Application:
 
 
 def main() -> None:
+    load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting the bot")
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env, "
+            "вставьте новый токен после знака = и запустите бот снова."
+        )
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
