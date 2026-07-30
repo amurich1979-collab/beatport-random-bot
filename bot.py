@@ -13,7 +13,12 @@ from urllib.parse import urlencode, urljoin
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -30,6 +35,11 @@ MIN_DATE = date(2004, 1, 1)
 GENRE_SLUGS = tuple(GENRES)
 PAGE_SIZE = 8
 _INSTANCE_LOCK: IO[str] | None = None
+LINK_PREVIEW = LinkPreviewOptions(
+    is_disabled=False,
+    prefer_large_media=True,
+    show_above_text=False,
+)
 
 
 def acquire_instance_lock() -> None:
@@ -648,7 +658,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             target_url = catalog_url
             open_label = "Открыть каталог"
         await query.edit_message_text(
-            text + (f"\nПоджанр: {subgenre['title']}" if subgenre else ""),
+            text
+            + (f"\nПоджанр: {subgenre['title']}" if subgenre else "")
+            + f"\n\n{target_url}",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton(open_label, url=target_url)],
@@ -660,6 +672,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     [InlineKeyboardButton("В меню", callback_data="menu")],
                 ]
             ),
+            link_preview_options=LINK_PREVIEW,
         )
     elif data == "random-day":
         start_date, end_date = effective_range(context.user_data)
@@ -672,7 +685,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await query.edit_message_text(
             f"Жанр: {genre_title}\nДата: {selected_date:%d.%m.%Y}"
-            + (f"\nПоджанр: {subgenre['title']}" if subgenre else ""),
+            + (f"\nПоджанр: {subgenre['title']}" if subgenre else "")
+            + f"\n\n{url}",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("Открыть Beatport", url=url)],
@@ -684,6 +698,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     [InlineKeyboardButton("В меню", callback_data="menu")],
                 ]
             ),
+            link_preview_options=LINK_PREVIEW,
         )
 
 

@@ -7,6 +7,7 @@ import pytest
 
 from bot import (
     GENRE_SLUGS,
+    LINK_PREVIEW,
     MIN_DATE,
     date_menu,
     effective_range,
@@ -144,6 +145,11 @@ def test_main_menu_preserves_original_actions_and_adds_filters():
     ]
     callbacks = {callback for _, callback in buttons}
     assert {"subgenres", "dates-menu", "reset"} <= callbacks
+
+
+def test_telegram_link_preview_is_enabled_for_cover_cards():
+    assert LINK_PREVIEW.is_disabled is False
+    assert LINK_PREVIEW.prefer_large_media is True
 
 
 def test_subgenre_results_menu_builds_selectable_buttons():
