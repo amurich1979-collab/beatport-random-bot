@@ -1,5 +1,6 @@
 import random
 from datetime import date
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -139,3 +140,10 @@ def test_subgenre_results_menu_builds_selectable_buttons():
         for row in markup.inline_keyboard
         for button in row
     )
+
+
+def test_lock_file_is_ignored_by_git():
+    gitignore = (
+        Path(__file__).parents[1].joinpath(".gitignore").read_text(encoding="utf-8")
+    )
+    assert ".bot.lock" in gitignore

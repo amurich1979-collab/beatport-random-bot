@@ -6,6 +6,8 @@ import logging
 import os
 import random
 from datetime import date, timedelta
+from pathlib import Path
+from typing import IO
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
@@ -25,6 +27,33 @@ LOGGER = logging.getLogger(__name__)
 MIN_DATE = date(2004, 1, 1)
 GENRE_SLUGS = tuple(GENRES)
 PAGE_SIZE = 8
+_INSTANCE_LOCK: IO[str] | None = None
+
+
+def acquire_instance_lock() -> None:
+    """Prevent two polling processes from using the same bot token."""
+    global _INSTANCE_LOCK
+    lock_path = Path(__file__).with_name(".bot.lock")
+    handle = lock_path.open("a+", encoding="ascii")
+    handle.seek(0)
+    handle.write("1")
+    handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise SystemExit(
+            "Бот уже запущен. Закройте прежнее окно перед повторным запуском."
+        ) from error
+    _INSTANCE_LOCK = handle
 
 
 def parse_iso_date(value: str) -> date:
@@ -586,10 +615,12 @@ def main() -> None:
             "TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env, "
             "вставьте новый токен после знака = и запустите бот снова."
         )
+    acquire_instance_lock()
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     build_application(token).run_polling(drop_pending_updates=True)
 
 
